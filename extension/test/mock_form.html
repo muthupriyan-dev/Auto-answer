@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mock Google Form — Developer Verification Suite</title>
+  <link rel="stylesheet" href="../content.css">
+  <style>
+    body {
+      background-color: #ede7f6;
+      font-family: Roboto, Arial, sans-serif;
+      margin: 0;
+      padding: 24px;
+      display: flex;
+      justify-content: center;
+    }
+    .form-wrapper {
+      width: 100%;
+      max-width: 640px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .form-card {
+      background: #ffffff;
+      border-radius: 8px;
+      padding: 24px;
+      border: 1px solid #dadce0;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.12);
+    }
+    .form-header {
+      border-top: 10px solid #673ab7;
+    }
+    .form-header h1 {
+      margin: 0 0 8px 0;
+      font-size: 24px;
+      font-weight: 500;
+    }
+    .form-header p {
+      margin: 0;
+      color: #5f6368;
+      font-size: 14px;
+    }
+    .q-title {
+      font-size: 15px;
+      font-weight: 500;
+      margin-bottom: 14px;
+      color: #202124;
+    }
+    .required-star {
+      color: #d93025;
+      margin-left: 4px;
+    }
+    .q-desc {
+      font-size: 12px;
+      color: #5f6368;
+      margin-top: -10px;
+      margin-bottom: 12px;
+    }
+    .text-input, .textarea-input {
+      width: 100%;
+      padding: 10px;
+      border: 1px solid #dadce0;
+      border-radius: 4px;
+      box-sizing: border-box;
+      font-size: 14px;
+    }
+    .radio-option, .checkbox-option {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 6px 0;
+      cursor: pointer;
+    }
+    .radio-box, .check-box {
+      width: 18px;
+      height: 18px;
+      border: 2px solid #5f6368;
+      border-radius: 50%;
+      display: inline-block;
+    }
+    .check-box {
+      border-radius: 2px;
+    }
+    [aria-checked="true"] .radio-box {
+      border-color: #673ab7;
+      background: radial-gradient(circle, #673ab7 50%, transparent 50%);
+    }
+    [aria-checked="true"] .check-box {
+      background-color: #673ab7;
+      border-color: #673ab7;
+    }
+    .submit-btn {
+      background-color: #673ab7;
+      color: #ffffff;
+      border: none;
+      padding: 10px 24px;
+      border-radius: 4px;
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+      align-self: flex-start;
+    }
+    .dropdown-container {
+      position: relative;
+    }
+    .custom-listbox {
+      border: 1px solid #dadce0;
+      border-radius: 4px;
+      padding: 10px 14px;
+      cursor: pointer;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background: #fafafa;
+    }
+    .dropdown-options-menu {
+      display: none;
+      border: 1px solid #dadce0;
+      border-radius: 4px;
+      margin-top: 4px;
+      background: #ffffff;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.15);
+    }
+    .dropdown-options-menu.open {
+      display: block;
+    }
+    .dropdown-option {
+      padding: 10px 14px;
+      cursor: pointer;
+    }
+    .dropdown-option:hover {
+      background-color: #f1f3f4;
+    }
+  </style>
+</head>
+<body>
+  <div class="form-wrapper">
+    <!-- Header -->
+    <div class="form-card form-header">
+      <div role="heading" aria-level="1">Developer & Research Survey 2026</div>
+      <p>A simulated Google Form to test scanning, suggestion generation, and fill actions.</p>
+    </div>
+
+    <!-- Question 1: Short Answer (Required) -->
+    <div role="listitem" class="form-card Qr7Oae">
+      <div class="q-title" role="heading">
+        <span>What is your full name?</span>
+        <span class="required-star vnumgf">*</span>
+      </div>
+      <div class="q-desc">Personal identification question (expected low confidence warning)</div>
+      <input type="text" class="text-input whsOnd" placeholder="Your answer">
+    </div>
+
+    <!-- Question 2: Paragraph -->
+    <div role="listitem" class="form-card Qr7Oae">
+      <div class="q-title" role="heading">
+        <span>Describe the key differences between REST and GraphQL.</span>
+      </div>
+      <div class="q-desc">Technical explanation</div>
+      <textarea class="textarea-input KHxj8b" rows="3" placeholder="Your answer"></textarea>
+    </div>
+
+    <!-- Question 3: Multiple Choice -->
+    <div role="listitem" class="form-card Qr7Oae">
+      <div class="q-title" role="heading">
+        <span>Which protocol does HTTP/3 use for transport?</span>
+        <span class="required-star vnumgf">*</span>
+      </div>
+      <div role="radiogroup">
+        <div role="radio" aria-checked="false" data-value="TCP" class="radio-option">
+          <span class="radio-box"></span>
+          <span>TCP</span>
+        </div>
+        <div role="radio" aria-checked="false" data-value="UDP / QUIC" class="radio-option">
+          <span class="radio-box"></span>
+          <span>UDP / QUIC</span>
+        </div>
+        <div role="radio" aria-checked="false" data-value="SCTP" class="radio-option">
+          <span class="radio-box"></span>
+          <span>SCTP</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Question 4: Checkbox -->
+    <div role="listitem" class="form-card Qr7Oae">
+      <div class="q-title" role="heading">
+        <span>Select all languages supported by the Node.js runtime natively or via compilation:</span>
+      </div>
+      <div role="group">
+        <div role="checkbox" aria-checked="false" data-value="JavaScript" class="checkbox-option">
+          <span class="check-box"></span>
+          <span>JavaScript</span>
+        </div>
+        <div role="checkbox" aria-checked="false" data-value="TypeScript" class="checkbox-option">
+          <span class="check-box"></span>
+          <span>TypeScript</span>
+        </div>
+        <div role="checkbox" aria-checked="false" data-value="WebAssembly (Wasm)" class="checkbox-option">
+          <span class="check-box"></span>
+          <span>WebAssembly (Wasm)</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Question 5: Dropdown -->
+    <div role="listitem" class="form-card Qr7Oae">
+      <div class="q-title" role="heading">
+        <span>Select your primary programming environment:</span>
+      </div>
+      <div class="dropdown-container">
+        <div role="listbox" aria-expanded="false" class="custom-listbox" tabindex="0">
+          <span id="selectedDropdownText">Choose</span>
+          <span style="font-size: 10px;">▼</span>
+        </div>
+        <div class="dropdown-options-menu" id="dropdownMenu">
+          <div role="option" class="dropdown-option">VS Code</div>
+          <div role="option" class="dropdown-option">Antigravity CLI / Termux</div>
+          <div role="option" class="dropdown-option">IntelliJ IDEA</div>
+          <div role="option" class="dropdown-option">Vim / Neovim</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Submit Button (Must NEVER be clicked by extension) -->
+    <div class="form-card" style="display: flex; justify-content: space-between; align-items: center;">
+      <button type="button" class="submit-btn" id="submitFormBtn">Submit Form</button>
+      <small style="color: #5f6368;">User must click this manually</small>
+    </div>
+  </div>
+
+  <!-- Interactive script to handle radio/checkbox clicks inside the mock -->
+  <script>
+    document.querySelectorAll('[role="radio"]').forEach(r => {
+      r.addEventListener('click', () => {
+        const group = r.closest('[role="radiogroup"]');
+        group.querySelectorAll('[role="radio"]').forEach(item => item.setAttribute('aria-checked', 'false'));
+        r.setAttribute('aria-checked', 'true');
+      });
+    });
+
+    document.querySelectorAll('[role="checkbox"]').forEach(cb => {
+      cb.addEventListener('click', () => {
+        const isChecked = cb.getAttribute('aria-checked') === 'true';
+        cb.setAttribute('aria-checked', isChecked ? 'false' : 'true');
+      });
+    });
+
+    const listbox = document.querySelector('[role="listbox"]');
+    const dropdownMenu = document.getElementById('dropdownMenu');
+    const selectedText = document.getElementById('selectedDropdownText');
+    if (listbox && dropdownMenu) {
+      listbox.addEventListener('click', () => {
+        dropdownMenu.classList.toggle('open');
+      });
+      document.querySelectorAll('[role="option"]').forEach(opt => {
+        opt.addEventListener('click', () => {
+          if (selectedText) selectedText.textContent = opt.textContent.trim();
+          dropdownMenu.classList.remove('open');
+        });
+      });
+    }
+
+    document.getElementById('submitFormBtn').addEventListener('click', () => {
+      alert('Mock form submitted manually by user!');
+    });
+  </script>
+
+  <!-- Load content script for mock testing -->
+  <script src="../content.js"></script>
+</body>
+</html>

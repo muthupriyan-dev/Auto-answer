@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Gemini Forms Assistant</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="popup-container">
+    <!-- Header -->
+    <header class="header">
+      <div class="header-brand">
+        <div class="brand-dot"></div>
+        <h1 class="title">Gemini Forms</h1>
+      </div>
+      <span class="badge">v1.0.0</span>
+    </header>
+
+    <!-- Backend Connection Card -->
+    <section class="card connection-card" aria-label="Backend Status">
+      <div class="status-row">
+        <span class="status-label">Backend Status:</span>
+        <span id="connectionStatus" class="status-pill status-checking">
+          <span class="status-indicator"></span>
+          <span id="statusText">Checking...</span>
+        </span>
+      </div>
+      <div id="modelInfo" class="model-info" style="display: none;">
+        Model: <strong id="detectedModel">-</strong>
+      </div>
+    </section>
+
+    <!-- Settings Form -->
+    <main class="settings-form">
+      <!-- Backend URL -->
+      <div class="form-group">
+        <label for="backendUrl" class="input-label">Backend Service URL</label>
+        <div class="input-with-button">
+          <input 
+            type="url" 
+            id="backendUrl" 
+            placeholder="http://localhost:3000" 
+            spellcheck="false"
+            required
+            aria-describedby="backendHelp"
+          >
+          <button type="button" id="testBtn" class="btn btn-secondary">Test</button>
+        </div>
+        <small id="backendHelp" class="help-text">Local server or deployed URL (e.g. Render, Railway)</small>
+      </div>
+
+      <!-- Dot Position -->
+      <div class="form-group">
+        <label for="dotCorner" class="input-label">Dot Position on Form</label>
+        <select id="dotCorner" class="select-input">
+          <option value="bottom-right">Bottom-Right (Default)</option>
+          <option value="bottom-left">Bottom-Left</option>
+          <option value="top-right">Top-Right</option>
+          <option value="top-left">Top-Left</option>
+        </select>
+      </div>
+
+      <!-- Overwrite toggle -->
+      <div class="form-group checkbox-group">
+        <label class="checkbox-label">
+          <input type="checkbox" id="overwriteExisting">
+          <span class="custom-checkbox"></span>
+          <span class="checkbox-text">
+            <strong>Overwrite existing answers</strong>
+            <small>If unchecked, already filled questions will be preserved</small>
+          </span>
+        </label>
+      </div>
+
+      <!-- Action Button -->
+      <button type="button" id="saveBtn" class="btn btn-primary full-width">
+        Save Settings
+      </button>
+      <div id="saveFeedback" class="feedback-msg" role="status" aria-live="polite"></div>
+    </main>
+
+    <!-- Android Compatibility Tip -->
+    <div class="info-box mobile-info">
+      <span class="info-icon" aria-hidden="true">📱</span>
+      <div class="info-content">
+        <strong>Android Compatibility:</strong>
+        <p>Standard Chrome on Android does not support extensions. Use <strong>Kiwi Browser</strong> or <strong>Lemur Browser</strong> to run this extension on Android.</p>
+      </div>
+    </div>
+
+    <!-- Privacy & Disclosure -->
+    <footer class="footer">
+      <p class="privacy-note">
+        🔒 <strong>Privacy:</strong> Questions are sent only to your configured backend & Gemini API. Form submission is <strong>always manual</strong>.
+      </p>
+    </footer>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
