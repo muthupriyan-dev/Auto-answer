@@ -7,6 +7,9 @@
  * 2. Menu stays hidden until clicked.
  * 3. Answers are ONLY filled after explicit user approval.
  * 4. NEVER clicks Submit or submits forms automatically.
+ *
+ * Backend calls go through background.js (message type API_REQUEST) so the API key
+ * and CORS origin are handled by the extension, not by the web page.
  */
 
 (function () {
@@ -19,7 +22,6 @@
   // --- STATE MANAGEMENT ---
   const state = {
     status: 'gray', // 'gray' | 'blue' | 'green' | 'red'
-    backendUrl: 'http://localhost:3000',
     dotCorner: 'bottom-right',
     overwriteExisting: false,
     formTitle: '',
@@ -29,12 +31,87 @@
     editedAnswers: new Map() // questionId -> string | array
   };
 
+  const INTERACTIVE_SELECTOR =
+    'input, textarea, div[role="radiogroup"], div[role="group"], div[role="listbox"], div[role="radio"], div[role="checkbox"]';
+  const OPTION_AREA_SELECTOR =
+    'div[role="radiogroup"], div[role="group"], div[role="listbox"], div[role="radio"], div[role="checkbox"], div[role="option"]';
+  const OVERWRITE_SKIP_REASON = 'Field already contains an answer (overwrite disabled)';
+
   // --- DOM CACHE & ELEMENTS ---
   let dotElement = null;
   let menuElement = null;
   let reviewOverlay = null;
   let toastElement = null;
   let liveRegion = null;
+  let suggestionsBusy = false;
+
+  // --- SMALL HELPERS ---
+  function normalizeText(value) {
+    return String(value === undefined || value === null ? '' : value)
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, ' ');
+  }
+
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  async function waitFor(fn, timeoutMs = 1500, intervalMs = 50) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const result = fn();
+      if (result) return result;
+      await sleep(intervalMs);
+    }
+    return fn() || null;
+  }
+
+  function toAnswerList(answer) {
+    const list = Array.isArray(answer) ? answer : String(answer || '').split(',');
+    return list.map((a) => String(a).trim()).filter(Boolean);
+  }
+
+  function isEmptyAnswer(answer) {
+    if (Array.isArray(answer)) return toAnswerList(answer).length === 0;
+    return String(answer === undefined || answer === null ? '' : answer).trim() === '';
+  }
+
+  function optionLabel(el) {
+    return (el.getAttribute('data-value') || el.getAttribute('aria-label') || el.textContent || '').trim();
+  }
+
+  function dispatchMouseSequence(el) {
+    ['mousedown', 'mouseup', 'click'].forEach((type) => {
+      el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+    });
+  }
+
+  // --- BACKEND ACCESS (via background service worker) ---
+  function apiRequest(path, body) {
+    return new Promise((resolve, reject) => {
+      try {
+        chrome.runtime.sendMessage({ type: 'API_REQUEST', path, body }, (response) => {
+          const lastErr = chrome.runtime.lastError;
+          if (lastErr) {
+            reject(new Error(lastErr.message || 'Extension background is not reachable. Reload this page.'));
+            return;
+          }
+          if (!response) {
+            reject(new Error('No response from the extension background. Reload this page.'));
+            return;
+          }
+          if (!response.ok) {
+            reject(new Error(response.error || `Server responded with HTTP ${response.status}`));
+            return;
+          }
+          resolve(response.data);
+        });
+      } catch (e) {
+        reject(new Error('The extension was updated or reloaded. Please refresh this page.'));
+      }
+    });
+  }
 
   // --- INITIALIZATION ---
   async function init() {
@@ -49,7 +126,6 @@
     // Listen for storage changes
     chrome.storage.onChanged.addListener((changes, area) => {
       if (area === 'sync' || area === 'local') {
-        if (changes.backendUrl) state.backendUrl = changes.backendUrl.newValue;
         if (changes.dotCorner) {
           state.dotCorner = changes.dotCorner.newValue;
           updateDotPosition();
@@ -66,11 +142,9 @@
   async function loadSettings() {
     try {
       const config = await chrome.storage.sync.get({
-        backendUrl: 'http://localhost:3000',
         dotCorner: 'bottom-right',
         overwriteExisting: false
       });
-      state.backendUrl = config.backendUrl.replace(/\/+$/, '');
       state.dotCorner = config.dotCorner;
       state.overwriteExisting = config.overwriteExisting;
     } catch (e) {
@@ -224,7 +298,7 @@
 
     menuElement.querySelector('#gfa-act-fill').addEventListener('click', () => {
       closeActionMenu();
-      handleFillApprovedAnswers();
+      handleFillApprovedAnswers().catch(reportFillError);
     });
 
     menuElement.querySelector('#gfa-act-settings').addEventListener('click', () => {
@@ -268,7 +342,27 @@
     }
   }
 
+  function reportFillError(err) {
+    console.error('[Gemini Forms Assistant] Fill failed:', err);
+    setStatus('red', 'Fill failed');
+    showToast(`Fill failed: ${err && err.message ? err.message : 'unexpected error'}`);
+  }
+
   // --- 3. FORM SCANNER ---
+  function findQuestionTitle(container) {
+    const heading = container.querySelector('div[role="heading"], .M7eMe, .HoLXfc');
+    if (heading && heading.textContent.trim()) return heading.textContent.trim();
+
+    // Fallback: first text span that is NOT part of the answer options
+    const spans = container.querySelectorAll('span[dir="auto"]');
+    for (const span of spans) {
+      const wrapper = span.closest(OPTION_AREA_SELECTOR);
+      const insideOptions = wrapper && wrapper !== container && container.contains(wrapper);
+      if (!insideOptions && span.textContent.trim()) return span.textContent.trim();
+    }
+    return '';
+  }
+
   function scanForm() {
     const questions = [];
 
@@ -278,30 +372,26 @@
 
     // Find all question containers
     // Google Forms uses role="listitem" or .Qr7Oae or .geS5n
-    const containers = Array.from(document.querySelectorAll('div[role="listitem"], .Qr7Oae, .geS5n'));
-
-    // Filter to containers that actually house a question
-    const uniqueContainers = containers.filter(c => {
-      return c.querySelector('input, textarea, div[role="radiogroup"], div[role="group"], div[role="listbox"], div[role="radio"], div[role="checkbox"]');
+    const candidates = Array.from(document.querySelectorAll('div[role="listitem"], .Qr7Oae, .geS5n')).filter((c) => {
+      if (c.closest('#gfa-review-overlay, #gfa-action-menu')) return false;
+      return c.querySelector(INTERACTIVE_SELECTOR);
     });
+
+    // Drop nested duplicates: keep only the outermost container of each question
+    const uniqueContainers = candidates.filter((c) => !candidates.some((other) => other !== c && other.contains(c)));
 
     uniqueContainers.forEach((container, idx) => {
       const qId = `q_${idx + 1}`;
       container.setAttribute('data-gfa-id', qId);
 
-      // Question Title
-      const heading = container.querySelector('div[role="heading"], .M7eMe, .HoLXfc, span[dir="auto"]');
-      let title = heading ? heading.textContent.trim() : `Question ${idx + 1}`;
+      // Question Title (keep raw text to detect the required asterisk)
+      const rawTitle = findQuestionTitle(container);
+      const title = (rawTitle || `Question ${idx + 1}`).replace(/\s*\*\s*$/, '').trim();
 
-      // Clean required asterisk indicator from title text
-      title = title.replace(/\s*\*\s*$/, '').trim();
-
-      // Required flag
-      const isRequired = Boolean(
-        container.querySelector('.vnumgf, [aria-label*="required"], span[aria-hidden="false"] > *') ||
-        container.querySelector('span[aria-label="Required question"]') ||
-        container.innerHTML.includes('*')
-      );
+      // Required flag: explicit ARIA markers or a trailing asterisk on the title
+      const isRequired =
+        Boolean(container.querySelector('[aria-required="true"], [aria-label="Required question"]')) ||
+        /\*\s*$/.test(rawTitle);
 
       // Description/Help text
       const descEl = container.querySelector('.gfh2eb, .AgroKb, [id*="desc"]');
@@ -319,24 +409,21 @@
 
       if (radioGroup) {
         type = 'MULTIPLE_CHOICE';
-        const radioEls = container.querySelectorAll('div[role="radio"]');
-        radioEls.forEach(r => {
-          const optLabel = r.getAttribute('data-value') || r.getAttribute('aria-label') || r.innerText.trim();
-          if (optLabel && !options.includes(optLabel)) options.push(optLabel);
+        container.querySelectorAll('div[role="radio"]').forEach((r) => {
+          const label = optionLabel(r);
+          if (label && !options.includes(label)) options.push(label);
         });
       } else if (checkboxGroup) {
         type = 'CHECKBOX';
-        const cbEls = container.querySelectorAll('div[role="checkbox"]');
-        cbEls.forEach(cb => {
-          const optLabel = cb.getAttribute('data-value') || cb.getAttribute('aria-label') || cb.innerText.trim();
-          if (optLabel && !options.includes(optLabel)) options.push(optLabel);
+        container.querySelectorAll('div[role="checkbox"]').forEach((cb) => {
+          const label = optionLabel(cb);
+          if (label && !options.includes(label)) options.push(label);
         });
       } else if (listbox) {
         type = 'DROPDOWN';
-        const optEls = container.querySelectorAll('div[role="option"], option');
-        optEls.forEach(opt => {
-          const optLabel = opt.innerText.trim();
-          if (optLabel && optLabel !== 'Choose' && !options.includes(optLabel)) options.push(optLabel);
+        container.querySelectorAll('div[role="option"], option').forEach((opt) => {
+          const label = (opt.getAttribute('data-value') || opt.textContent || '').trim();
+          if (label && label !== 'Choose' && !options.includes(label)) options.push(label);
         });
       } else if (textarea) {
         type = 'PARAGRAPH';
@@ -373,8 +460,13 @@
     }
   }
 
-  // --- 4. COMMUNICATE WITH GEMINI API (VIA BACKEND) ---
+  // --- 4. COMMUNICATE WITH GEMINI API (VIA BACKGROUND -> BACKEND) ---
   async function handleGetSuggestions() {
+    if (suggestionsBusy) {
+      showToast('Still waiting for Gemini. Please wait...');
+      return;
+    }
+
     const questions = scanForm();
     if (questions.length === 0) {
       setStatus('red', 'No questions detected');
@@ -382,13 +474,14 @@
       return;
     }
 
+    suggestionsBusy = true;
     setStatus('blue', 'Querying Gemini...');
     showToast(`Sending ${questions.length} questions to Gemini...`);
 
     try {
       const payload = {
         formTitle: state.formTitle,
-        questions: questions.map(q => ({
+        questions: questions.map((q) => ({
           id: q.id,
           type: q.type,
           title: q.title,
@@ -398,19 +491,8 @@
         }))
       };
 
-      const res = await fetch(`${state.backendUrl}/api/suggest`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-
-      if (!res.ok) {
-        const errorData = await res.json().catch(() => ({}));
-        throw new Error(errorData.error || `Server responded with HTTP ${res.status}`);
-      }
-
-      const data = await res.json();
-      if (!data.success || !Array.isArray(data.suggestions)) {
+      const data = await apiRequest('/api/suggest', payload);
+      if (!data || !Array.isArray(data.suggestions)) {
         throw new Error('Invalid response structure received from backend.');
       }
 
@@ -420,7 +502,7 @@
       state.approvedMap.clear();
       state.editedAnswers.clear();
 
-      data.suggestions.forEach(s => {
+      data.suggestions.forEach((s) => {
         state.approvedMap.set(s.questionId, false); // Explicit human approval required!
         state.editedAnswers.set(s.questionId, s.suggestedAnswer);
       });
@@ -434,6 +516,8 @@
       console.error('[Gemini Forms Assistant Error]', err);
       setStatus('red', 'Error occurred');
       showToast(`Error: ${err.message}`);
+    } finally {
+      suggestionsBusy = false;
     }
   }
 
@@ -476,7 +560,7 @@
 
     reviewOverlay.querySelector('#gfa-modal-fill-btn').addEventListener('click', () => {
       closeReviewModal();
-      handleFillApprovedAnswers();
+      handleFillApprovedAnswers().catch(reportFillError);
     });
 
     // Close on overlay backdrop click
@@ -516,16 +600,18 @@
     if (!container) return;
     container.innerHTML = '';
 
-    const questionMap = new Map(state.scannedQuestions.map(q => [q.id, q]));
+    const questionMap = new Map(state.scannedQuestions.map((q) => [q.id, q]));
 
     state.suggestions.forEach((s, idx) => {
       const originalQ = questionMap.get(s.questionId) || {};
+      const qType = s.questionType || originalQ.type;
       const card = document.createElement('div');
       card.className = `gfa-q-card ${state.approvedMap.get(s.questionId) ? 'gfa-approved' : ''}`;
       card.id = `gfa-card-${s.questionId}`;
 
       const isApproved = state.approvedMap.get(s.questionId) || false;
-      const currentAnswer = state.editedAnswers.get(s.questionId) || s.suggestedAnswer || '';
+      const storedAnswer = state.editedAnswers.has(s.questionId) ? state.editedAnswers.get(s.questionId) : s.suggestedAnswer;
+      const currentAnswerText = Array.isArray(storedAnswer) ? storedAnswer.join(', ') : String(storedAnswer || '');
 
       card.innerHTML = `
         <div class="gfa-q-header">
@@ -533,7 +619,7 @@
             ${idx + 1}. ${escapeHtml(s.questionText || originalQ.title || 'Question')}
           </div>
           <div class="gfa-q-badges">
-            <span class="gfa-badge gfa-badge-type">${escapeHtml(originalQ.type || 'TEXT')}</span>
+            <span class="gfa-badge gfa-badge-type">${escapeHtml(qType || 'TEXT')}</span>
             <span class="gfa-badge gfa-badge-conf-${escapeHtml(s.confidence || 'medium')}">${escapeHtml(s.confidence || 'MED')}</span>
           </div>
         </div>
@@ -547,10 +633,15 @@
         <div class="gfa-q-input-wrap">
           <label class="gfa-q-input-label" for="gfa-input-${s.questionId}">Suggested / Editable Answer:</label>
           ${
-            originalQ.type === 'PARAGRAPH'
-              ? `<textarea class="gfa-input-textarea" id="gfa-input-${s.questionId}">${escapeHtml(currentAnswer)}</textarea>`
-              : `<input type="text" class="gfa-input-text" id="gfa-input-${s.questionId}" value="${escapeHtml(Array.isArray(currentAnswer) ? currentAnswer.join(', ') : currentAnswer)}">`
+            qType === 'PARAGRAPH'
+              ? `<textarea class="gfa-input-textarea" id="gfa-input-${s.questionId}">${escapeHtml(currentAnswerText)}</textarea>`
+              : `<input type="text" class="gfa-input-text" id="gfa-input-${s.questionId}" value="${escapeHtml(currentAnswerText)}">`
           }
+        </div>
+
+        <div class="gfa-q-input-wrap">
+          <label class="gfa-q-input-label" for="gfa-ctx-${s.questionId}">Extra context for Regenerate (optional):</label>
+          <input type="text" class="gfa-input-text" id="gfa-ctx-${s.questionId}" maxlength="500" placeholder="e.g. answer in one short sentence">
         </div>
 
         <div class="gfa-q-footer">
@@ -568,8 +659,8 @@
       const inputEl = card.querySelector(`#gfa-input-${s.questionId}`);
       inputEl.addEventListener('input', (e) => {
         let val = e.target.value;
-        if (originalQ.type === 'CHECKBOX') {
-          val = val.split(',').map(item => item.trim()).filter(Boolean);
+        if (qType === 'CHECKBOX') {
+          val = val.split(',').map((item) => item.trim()).filter(Boolean);
         }
         state.editedAnswers.set(s.questionId, val);
       });
@@ -586,7 +677,9 @@
       // Event listener for single question regeneration
       const regenBtn = card.querySelector('.gfa-btn-regen');
       regenBtn.addEventListener('click', async () => {
-        await handleSingleRegenerate(s.questionId, originalQ);
+        const ctxEl = card.querySelector(`#gfa-ctx-${s.questionId}`);
+        const customContext = ctxEl ? ctxEl.value.trim() : '';
+        await handleSingleRegenerate(s.questionId, originalQ, customContext);
       });
 
       container.appendChild(card);
@@ -607,7 +700,7 @@
   }
 
   // --- 6. SINGLE QUESTION REGENERATION ---
-  async function handleSingleRegenerate(qId, questionObj) {
+  async function handleSingleRegenerate(qId, questionObj, customContext = '') {
     const card = document.getElementById(`gfa-card-${qId}`);
     if (!card) return;
 
@@ -615,30 +708,30 @@
     if (regenBtn) regenBtn.textContent = '⏳ Thinking...';
 
     try {
-      const res = await fetch(`${state.backendUrl}/api/regenerate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          formTitle: state.formTitle,
-          question: {
-            id: questionObj.id || qId,
-            type: questionObj.type || 'SHORT_ANSWER',
-            title: questionObj.title,
-            description: questionObj.description,
-            required: questionObj.required,
-            options: questionObj.options
-          }
-        })
+      // Make sure we have the real question (with its options) to send
+      let q = questionObj && questionObj.title ? questionObj : scanForm().find((x) => x.id === qId);
+      if (!q) throw new Error('Could not find this question on the page.');
+
+      const data = await apiRequest('/api/regenerate', {
+        formTitle: state.formTitle,
+        customContext,
+        question: {
+          id: q.id || qId,
+          type: q.type || 'SHORT_ANSWER',
+          title: q.title,
+          description: q.description,
+          required: q.required,
+          options: q.options
+        }
       });
 
-      const data = await res.json();
-      if (!data.success || !data.suggestion) {
-        throw new Error(data.error || 'Regeneration failed');
+      if (!data || !data.suggestion) {
+        throw new Error('Regeneration failed');
       }
 
       // Update state
       const newSug = data.suggestion;
-      const idx = state.suggestions.findIndex(s => s.questionId === qId);
+      const idx = state.suggestions.findIndex((s) => s.questionId === qId);
       if (idx !== -1) {
         state.suggestions[idx] = newSug;
       }
@@ -656,38 +749,45 @@
   }
 
   // --- 7. FILL APPROVED ANSWERS SAFELY ---
-  function handleFillApprovedAnswers() {
+  async function handleFillApprovedAnswers() {
     let approvedCount = 0;
     let filledCount = 0;
     let skippedCount = 0;
     const skippedReasons = [];
 
-    // Map questions to DOM
+    // Re-scan so we act on the live DOM
     scanForm();
-    const questionMap = new Map(state.scannedQuestions.map(q => [q.id, q]));
+    const byId = new Map(state.scannedQuestions.map((q) => [q.id, q]));
+    const byTitle = new Map(state.scannedQuestions.map((q) => [normalizeText(q.title), q]));
 
-    state.suggestions.forEach(s => {
-      const isApproved = state.approvedMap.get(s.questionId);
-      if (!isApproved) return;
+    for (const s of state.suggestions) {
+      if (!state.approvedMap.get(s.questionId)) continue;
 
       approvedCount++;
-      const q = questionMap.get(s.questionId);
-      if (!q || !q.containerRef) {
-        skippedCount++;
-        skippedReasons.push(`Could not safely locate Question ${s.questionId} in the page DOM.`);
-        return;
+
+      // Match by id, but verify the title still matches (multi-section forms can shift the DOM)
+      const expectedTitle = normalizeText(s.questionText);
+      let q = byId.get(s.questionId);
+      if (expectedTitle && (!q || normalizeText(q.title) !== expectedTitle)) {
+        q = byTitle.get(expectedTitle) || null;
       }
 
-      const answerToFill = state.editedAnswers.get(s.questionId) || s.suggestedAnswer;
-      const success = fillQuestionField(q, answerToFill);
+      if (!q || !q.containerRef) {
+        skippedCount++;
+        skippedReasons.push(`Could not safely locate "${s.questionText || s.questionId}" in the page DOM.`);
+        continue;
+      }
 
-      if (success.filled) {
+      const answerToFill = state.editedAnswers.has(s.questionId) ? state.editedAnswers.get(s.questionId) : s.suggestedAnswer;
+      const result = await fillQuestionField(q, answerToFill);
+
+      if (result.filled) {
         filledCount++;
       } else {
         skippedCount++;
-        skippedReasons.push(`Question "${q.title}": ${success.reason}`);
+        skippedReasons.push(`Question "${q.title}": ${result.reason}`);
       }
-    });
+    }
 
     if (approvedCount === 0) {
       showToast('No answers approved yet. Open "Review Suggested Answers" to approve fields.');
@@ -710,9 +810,55 @@
     }
   }
 
-  function fillQuestionField(questionObj, answer) {
+  function getDropdownSelection(container) {
+    const selected = container.querySelector('div[role="option"][aria-selected="true"]');
+    if (!selected) return '';
+    const raw = selected.hasAttribute('data-value') ? selected.getAttribute('data-value') : selected.textContent;
+    const value = (raw || '').trim();
+    return normalizeText(value) === 'choose' ? '' : value;
+  }
+
+  function findDropdownOption(container, target) {
+    const matches = (opt) => normalizeText(opt.getAttribute('data-value') || opt.textContent) === target;
+
+    // Options normally live inside the question's own listbox
+    const local = Array.from(container.querySelectorAll('div[role="option"]')).find(matches);
+    if (local) return local;
+
+    // Fallback: a popup rendered elsewhere on the page (only visible options)
+    return (
+      Array.from(document.querySelectorAll('div[role="option"]')).find((opt) => opt.offsetParent !== null && matches(opt)) || null
+    );
+  }
+
+  async function fillDropdown(container, answer) {
+    const target = normalizeText(answer);
+    const listbox = container.querySelector('div[role="listbox"]');
+    if (!listbox) return { filled: false, reason: 'Dropdown container not found' };
+
+    const current = getDropdownSelection(container);
+    if (current && normalizeText(current) === target) return { filled: true, reason: 'Already selected' };
+    if (current && !state.overwriteExisting) return { filled: false, reason: OVERWRITE_SKIP_REASON };
+
+    // Open the dropdown, wait for the options to exist, then pick the match
+    dispatchMouseSequence(listbox);
+    const option = await waitFor(() => findDropdownOption(container, target), 1500);
+    if (!option) {
+      return { filled: false, reason: `Option "${answer}" was not found in the dropdown.` };
+    }
+
+    dispatchMouseSequence(option);
+    await sleep(120);
+    return { filled: true };
+  }
+
+  async function fillQuestionField(questionObj, answer) {
     const container = questionObj.containerRef;
     if (!container) return { filled: false, reason: 'DOM element not found' };
+
+    if (isEmptyAnswer(answer)) {
+      return { filled: false, reason: 'No answer provided (nothing to fill)' };
+    }
 
     switch (questionObj.type) {
       case 'SHORT_ANSWER': {
@@ -720,7 +866,7 @@
         if (!input) return { filled: false, reason: 'Text input element not found' };
 
         if (!state.overwriteExisting && input.value && input.value.trim() !== '') {
-          return { filled: false, reason: 'Field already contains an answer (overwrite disabled)' };
+          return { filled: false, reason: OVERWRITE_SKIP_REASON };
         }
 
         setInputValue(input, String(answer || ''));
@@ -732,7 +878,7 @@
         if (!textarea) return { filled: false, reason: 'Textarea element not found' };
 
         if (!state.overwriteExisting && textarea.value && textarea.value.trim() !== '') {
-          return { filled: false, reason: 'Field already contains an answer (overwrite disabled)' };
+          return { filled: false, reason: OVERWRITE_SKIP_REASON };
         }
 
         setInputValue(textarea, String(answer || ''));
@@ -740,19 +886,11 @@
       }
 
       case 'MULTIPLE_CHOICE': {
-        const targetStr = String(answer || '').trim().toLowerCase();
-        const radios = container.querySelectorAll('div[role="radio"]');
+        const targetStr = normalizeText(answer);
+        const radios = Array.from(container.querySelectorAll('div[role="radio"]'));
         if (radios.length === 0) return { filled: false, reason: 'Radio options not found' };
 
-        let matchedRadio = null;
-        for (const r of radios) {
-          const val = (r.getAttribute('data-value') || r.getAttribute('aria-label') || r.innerText || '').trim().toLowerCase();
-          if (val === targetStr) {
-            matchedRadio = r;
-            break;
-          }
-        }
-
+        const matchedRadio = radios.find((r) => normalizeText(optionLabel(r)) === targetStr);
         if (!matchedRadio) {
           return { filled: false, reason: `Option "${answer}" did not match any available radio choice.` };
         }
@@ -761,55 +899,44 @@
           return { filled: true, reason: 'Already selected' };
         }
 
+        const hasSelection = radios.some((r) => r.getAttribute('aria-checked') === 'true');
+        if (!state.overwriteExisting && hasSelection) {
+          return { filled: false, reason: OVERWRITE_SKIP_REASON };
+        }
+
         matchedRadio.click();
         return { filled: true };
       }
 
       case 'CHECKBOX': {
-        const targetList = Array.isArray(answer)
-          ? answer.map(a => String(a).trim().toLowerCase())
-          : String(answer || '').split(',').map(a => a.trim().toLowerCase());
-
-        const checkboxes = container.querySelectorAll('div[role="checkbox"]');
+        const targetList = toAnswerList(answer).map(normalizeText);
+        const checkboxes = Array.from(container.querySelectorAll('div[role="checkbox"]'));
         if (checkboxes.length === 0) return { filled: false, reason: 'Checkboxes not found' };
 
-        let anyChecked = false;
-        checkboxes.forEach(cb => {
-          const val = (cb.getAttribute('data-value') || cb.getAttribute('aria-label') || cb.innerText || '').trim().toLowerCase();
-          const shouldCheck = targetList.includes(val);
-          const isCurrentlyChecked = cb.getAttribute('aria-checked') === 'true';
+        const isChecked = (cb) => cb.getAttribute('aria-checked') === 'true';
+        const shouldBeChecked = (cb) => targetList.includes(normalizeText(optionLabel(cb)));
 
-          if (shouldCheck && !isCurrentlyChecked) {
-            cb.click();
-            anyChecked = true;
-          }
+        if (!checkboxes.some(shouldBeChecked)) {
+          return { filled: false, reason: 'No matching checkbox options found for provided values.' };
+        }
+
+        const hasSelection = checkboxes.some(isChecked);
+        if (!state.overwriteExisting && hasSelection) {
+          const alreadyExact = checkboxes.every((cb) => isChecked(cb) === shouldBeChecked(cb));
+          return alreadyExact
+            ? { filled: true, reason: 'Already selected' }
+            : { filled: false, reason: OVERWRITE_SKIP_REASON };
+        }
+
+        // Bring every box to the desired state (with overwrite off nothing is checked yet, so this only checks)
+        checkboxes.forEach((cb) => {
+          if (isChecked(cb) !== shouldBeChecked(cb)) cb.click();
         });
-
-        return anyChecked
-          ? { filled: true }
-          : { filled: false, reason: 'No matching checkbox options found for provided values.' };
-      }
-
-      case 'DROPDOWN': {
-        const targetStr = String(answer || '').trim().toLowerCase();
-        const listbox = container.querySelector('div[role="listbox"]');
-        if (!listbox) return { filled: false, reason: 'Dropdown container not found' };
-
-        // Safe dropdown selection: Click listbox to expose options, match text, click option
-        listbox.click();
-        setTimeout(() => {
-          const options = document.querySelectorAll('div[role="option"]');
-          for (const opt of options) {
-            const optVal = (opt.innerText || opt.textContent || '').trim().toLowerCase();
-            if (optVal === targetStr) {
-              opt.click();
-              break;
-            }
-          }
-        }, 80);
-
         return { filled: true };
       }
+
+      case 'DROPDOWN':
+        return fillDropdown(container, answer);
 
       default:
         return { filled: false, reason: `Unsupported question type: ${questionObj.type}` };

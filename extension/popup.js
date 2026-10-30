@@ -4,6 +4,7 @@
 
 document.addEventListener('DOMContentLoaded', async () => {
   const backendUrlInput = document.getElementById('backendUrl');
+  const apiKeyInput = document.getElementById('apiKey');
   const dotCornerSelect = document.getElementById('dotCorner');
   const overwriteCheckbox = document.getElementById('overwriteExisting');
   const testBtn = document.getElementById('testBtn');
@@ -14,77 +15,135 @@ document.addEventListener('DOMContentLoaded', async () => {
   const detectedModel = document.getElementById('detectedModel');
   const saveFeedback = document.getElementById('saveFeedback');
 
-  // Load saved settings
+  function isLocalHost(hostname) {
+    return hostname === 'localhost' || hostname === '127.0.0.1';
+  }
+
+  // Returns a cleaned URL string, or null if it is not acceptable
+  function normalizeBackendUrl(raw) {
+    try {
+      const parsed = new URL(String(raw || '').trim());
+      const okProtocol = parsed.protocol === 'https:' || (parsed.protocol === 'http:' && isLocalHost(parsed.hostname));
+      if (!okProtocol) return null;
+      return parsed.origin + parsed.pathname.replace(/\/+$/, '');
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // Best effort: ask the browser for access to the deployed backend origin.
+  // Must be called directly from a click handler (user gesture).
+  async function ensureHostPermission(url) {
+    try {
+      const parsed = new URL(url);
+      if (isLocalHost(parsed.hostname)) return true;
+      if (!chrome.permissions || !chrome.permissions.request) return true;
+      const origins = [`${parsed.origin}/*`];
+      if (await chrome.permissions.contains({ origins })) return true;
+      return await chrome.permissions.request({ origins });
+    } catch (e) {
+      return true; // server-side CORS still allows the extension origin
+    }
+  }
+
+  // Load saved settings (the API key is kept in local storage only, never synced)
   const config = await chrome.storage.sync.get({
     backendUrl: 'http://localhost:3000',
     dotCorner: 'bottom-right',
     overwriteExisting: false
   });
+  const secrets = await chrome.storage.local.get({ apiKey: '' });
 
   backendUrlInput.value = config.backendUrl;
+  apiKeyInput.value = secrets.apiKey;
   dotCornerSelect.value = config.dotCorner;
   overwriteCheckbox.checked = config.overwriteExisting;
 
   // Run initial health check
-  await checkHealth(config.backendUrl);
+  await checkHealth(config.backendUrl, secrets.apiKey);
 
   // Test button click
   testBtn.addEventListener('click', async () => {
-    const url = backendUrlInput.value.trim().replace(/\/+$/, '');
-    await checkHealth(url);
+    const url = normalizeBackendUrl(backendUrlInput.value);
+    if (!url) {
+      showFeedback('Use a valid https:// URL (http:// only for localhost)', false);
+      return;
+    }
+    await checkHealth(url, apiKeyInput.value.trim());
   });
 
   // Save button click
   saveBtn.addEventListener('click', async () => {
-    let url = backendUrlInput.value.trim().replace(/\/+$/, '');
+    const url = normalizeBackendUrl(backendUrlInput.value);
     if (!url) {
-      showFeedback('Please enter a valid Backend URL', false);
+      showFeedback('Use a valid https:// URL (http:// only for localhost)', false);
       return;
     }
 
-    const newConfig = {
+    // Ask for host access FIRST so the click still counts as a user gesture
+    const granted = await ensureHostPermission(url);
+
+    const apiKey = apiKeyInput.value.trim();
+
+    await chrome.storage.sync.set({
       backendUrl: url,
       dotCorner: dotCornerSelect.value,
       overwriteExisting: overwriteCheckbox.checked
-    };
+    });
+    await chrome.storage.local.set({ apiKey });
 
-    await chrome.storage.sync.set(newConfig);
-    showFeedback('Settings saved successfully!', true);
-    await checkHealth(url);
+    backendUrlInput.value = url;
+    showFeedback(granted ? 'Settings saved successfully!' : 'Saved (browser access to the backend was not granted)', granted);
+    await checkHealth(url, apiKey);
   });
 
   // Health check helper function
-  async function checkHealth(baseUrl) {
+  async function checkHealth(baseUrl, apiKey) {
     setStatus('checking', 'Checking...');
     modelInfo.style.display = 'none';
 
-    try {
-      const cleanUrl = baseUrl.replace(/\/+$/, '');
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 4000);
+    const cleanUrl = String(baseUrl || '').replace(/\/+$/, '');
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 8000);
 
-      const res = await fetch(`${cleanUrl}/api/health`, {
-        signal: controller.signal
-      });
-      clearTimeout(timeoutId);
+    try {
+      const res = await fetch(`${cleanUrl}/api/health`, { signal: controller.signal });
 
       if (!res.ok) {
         throw new Error(`HTTP ${res.status}`);
       }
 
       const data = await res.json();
-      if (data.status === 'healthy') {
-        setStatus('online', 'Online');
-        if (data.model) {
-          detectedModel.textContent = data.model;
-          modelInfo.style.display = 'block';
-        }
-      } else {
+      if (data.status !== 'healthy') {
         setStatus('offline', 'Unhealthy');
+        return;
+      }
+
+      if (data.model) {
+        detectedModel.textContent = data.model;
+        modelInfo.style.display = 'block';
+      }
+
+      // Verify the API key is accepted by the backend
+      const authRes = await fetch(`${cleanUrl}/api/auth-check`, {
+        headers: apiKey ? { 'X-API-Key': apiKey } : {},
+        signal: controller.signal
+      });
+
+      if (authRes.ok) {
+        setStatus('online', 'Online');
+      } else if (authRes.status === 401) {
+        setStatus('offline', apiKey ? 'Wrong API key' : 'API key needed');
+      } else if (authRes.status === 503) {
+        setStatus('offline', 'Server API_SECRET not set');
+      } else {
+        setStatus('offline', `Auth error (HTTP ${authRes.status})`);
       }
     } catch (err) {
       setStatus('offline', 'Offline');
       console.warn('Backend connection error:', err.message);
+    } finally {
+      clearTimeout(timeoutId);
     }
   }
 
@@ -99,6 +158,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     setTimeout(() => {
       saveFeedback.textContent = '';
       saveFeedback.className = 'feedback-msg';
-    }, 3000);
+    }, 3500);
   }
 });

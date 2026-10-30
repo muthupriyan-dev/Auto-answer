@@ -14,7 +14,7 @@
         <div class="brand-dot"></div>
         <h1 class="title">Gemini Forms</h1>
       </div>
-      <span class="badge">v1.0.0</span>
+      <span class="badge">v1.1.0</span>
     </header>
 
     <!-- Backend Connection Card -->
@@ -47,7 +47,21 @@
           >
           <button type="button" id="testBtn" class="btn btn-secondary">Test</button>
         </div>
-        <small id="backendHelp" class="help-text">Local server or deployed URL (e.g. Render, Railway)</small>
+        <small id="backendHelp" class="help-text">Local server or deployed URL (e.g. Render, Railway). Deployed URLs must use https://</small>
+      </div>
+
+      <!-- API Key -->
+      <div class="form-group">
+        <label for="apiKey" class="input-label">API Key</label>
+        <input
+          type="password"
+          id="apiKey"
+          placeholder="Same value as API_SECRET on the backend"
+          spellcheck="false"
+          autocomplete="off"
+          aria-describedby="apiKeyHelp"
+        >
+        <small id="apiKeyHelp" class="help-text">Stored only on this device (not synced).</small>
       </div>
 
       <!-- Dot Position -->
