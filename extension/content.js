@@ -245,25 +245,25 @@
         <li>
           <button type="button" class="gfa-menu-item" id="gfa-act-scan" role="menuitem">
             <span class="gfa-menu-icon">🔍</span>
-            <span>1. Scan Form</span>
+            <span>1. Scan Form &amp; Auto Fill</span>
           </button>
         </li>
         <li>
           <button type="button" class="gfa-menu-item" id="gfa-act-suggest" role="menuitem">
             <span class="gfa-menu-icon">✨</span>
-            <span>2. Get Gemini Suggestions</span>
+            <span>2. Get Gemini Suggestions (manual)</span>
           </button>
         </li>
         <li>
           <button type="button" class="gfa-menu-item" id="gfa-act-review" role="menuitem">
             <span class="gfa-menu-icon">📝</span>
-            <span>3. Review Suggested Answers</span>
+            <span>3. Review Answers (optional)</span>
           </button>
         </li>
         <li>
           <button type="button" class="gfa-menu-item" id="gfa-act-fill" role="menuitem">
             <span class="gfa-menu-icon">✍️</span>
-            <span>4. Fill Approved Answers</span>
+            <span>4. Fill Approved Answers (manual)</span>
           </button>
         </li>
         <li>
@@ -283,12 +283,12 @@
 
     menuElement.querySelector('#gfa-act-scan').addEventListener('click', () => {
       closeActionMenu();
-      handleScanForm(true);
+      handleScanAndAutoFill();
     });
 
     menuElement.querySelector('#gfa-act-suggest').addEventListener('click', () => {
       closeActionMenu();
-      handleGetSuggestions();
+      handleGetSuggestions({ autoFill: false });
     });
 
     menuElement.querySelector('#gfa-act-review').addEventListener('click', () => {
@@ -460,8 +460,26 @@
     }
   }
 
+  // One-tap flow: scan -> Gemini -> auto approve -> auto fill (never submits the form)
+  async function handleScanAndAutoFill() {
+    const questions = scanForm();
+    if (questions.length === 0) {
+      setStatus('red', 'No questions found');
+      showToast('No supported form questions found on this page.');
+      return;
+    }
+    setStatus('blue', `${questions.length} questions found`);
+    showToast(`Scanned ${questions.length} questions. Getting answers...`);
+    try {
+      await handleGetSuggestions({ autoFill: true });
+    } catch (err) {
+      reportFillError(err);
+    }
+  }
+
   // --- 4. COMMUNICATE WITH GEMINI API (VIA BACKGROUND -> BACKEND) ---
-  async function handleGetSuggestions() {
+  async function handleGetSuggestions(options = {}) {
+    const autoFill = options.autoFill === true;
     if (suggestionsBusy) {
       showToast('Still waiting for Gemini. Please wait...');
       return;
@@ -498,19 +516,25 @@
 
       state.suggestions = data.suggestions;
 
-      // Initialize default approval state: ALWAYS DEFAULT TO FALSE
+      // Approval state: manual mode needs explicit approval, auto mode approves every non-empty answer
       state.approvedMap.clear();
       state.editedAnswers.clear();
 
       data.suggestions.forEach((s) => {
-        state.approvedMap.set(s.questionId, false); // Explicit human approval required!
+        const hasAnswer = !isEmptyAnswer(s.suggestedAnswer);
+        state.approvedMap.set(s.questionId, autoFill && hasAnswer);
         state.editedAnswers.set(s.questionId, s.suggestedAnswer);
       });
 
+      if (autoFill) {
+        setStatus('blue', 'Auto filling...');
+        suggestionsBusy = false;
+        await handleFillApprovedAnswers();
+        return;
+      }
+
       setStatus('green', 'Suggestions ready');
       showToast(`✨ Received ${data.suggestions.length} suggestions. Click Review to inspect.`);
-
-      // Prompt user or open review dialog
       openReviewModal();
     } catch (err) {
       console.error('[Gemini Forms Assistant Error]', err);
