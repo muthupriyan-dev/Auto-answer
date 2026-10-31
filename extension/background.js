@@ -6,8 +6,11 @@
  *   and the API key never touches the web page context.
  */
 
+const DEFAULT_BACKEND_URL = 'https://auto-answer-ini7.onrender.com';
+const OLD_DEFAULT_BACKEND_URL = 'http://localhost:3000';
+
 const DEFAULT_CONFIG = {
-  backendUrl: 'http://localhost:3000',
+  backendUrl: DEFAULT_BACKEND_URL,
   dotCorner: 'bottom-right',
   overwriteExisting: false
 };
@@ -28,6 +31,12 @@ chrome.runtime.onInstalled.addListener(async (details) => {
       if (current[key] === undefined) {
         toSet[key] = value;
       }
+    }
+
+    // Older versions saved http://localhost:3000 as the default. On an update,
+    // move that old default to the deployed backend (custom URLs are kept).
+    if (details.reason === 'update' && current.backendUrl === OLD_DEFAULT_BACKEND_URL) {
+      toSet.backendUrl = DEFAULT_BACKEND_URL;
     }
 
     if (Object.keys(toSet).length > 0) {
@@ -129,3 +138,4 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   return false;
 });
+q
