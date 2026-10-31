@@ -15,6 +15,12 @@ document.addEventListener('DOMContentLoaded', async () => {
   const detectedModel = document.getElementById('detectedModel');
   const saveFeedback = document.getElementById('saveFeedback');
 
+  const DEFAULT_BACKEND_URL = 'https://auto-answer-ini7.onrender.com';
+
+  // A sleeping Render free-tier service can take ~50s to wake up
+  const HEALTH_TIMEOUT_MS = 60000;
+  const WAKING_HINT_MS = 8000;
+
   function isLocalHost(hostname) {
     return hostname === 'localhost' || hostname === '127.0.0.1';
   }
@@ -48,7 +54,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // Load saved settings (the API key is kept in local storage only, never synced)
   const config = await chrome.storage.sync.get({
-    backendUrl: 'http://localhost:3000',
+    backendUrl: DEFAULT_BACKEND_URL,
     dotCorner: 'bottom-right',
     overwriteExisting: false
   });
@@ -104,7 +110,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     const cleanUrl = String(baseUrl || '').replace(/\/+$/, '');
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 8000);
+    const timeoutId = setTimeout(() => controller.abort(), HEALTH_TIMEOUT_MS);
+    // Still waiting after a few seconds: the backend is probably waking up
+    const wakingId = setTimeout(() => setStatus('checking', 'Waking up server...'), WAKING_HINT_MS);
 
     try {
       const res = await fetch(`${cleanUrl}/api/health`, { signal: controller.signal });
@@ -144,6 +152,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       console.warn('Backend connection error:', err.message);
     } finally {
       clearTimeout(timeoutId);
+      clearTimeout(wakingId);
     }
   }
 
