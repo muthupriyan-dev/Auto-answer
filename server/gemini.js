@@ -1,7 +1,12 @@
 /**
- * gemini.js - Google Gemini API Integration Module
+ * gemini.js - AI Integration Module (Gemini + Groq fallback)
  * Handles model communication, structured prompt generation, JSON schema validation,
  * option enforcement, confidence analysis, and sensitive data detection.
+ *
+ * Model fallback chain (first one that answers wins):
+ *   1. Gemini models, in order (default: 3.8 -> 3.6 -> 3.5 -> 3.1 -> 2.5 ...)
+ *   2. Groq models (only if GROQ_API_KEY is set)
+ * A model that is rate limited / unavailable is skipped for a while (cooldown).
  */
 
 const { GoogleGenerativeAI } = require('@google/generative-ai');
@@ -9,6 +14,22 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 const VALID_CONFIDENCE = ['high', 'medium', 'low'];
 // Matches placeholder answers such as "[Your personal details here]"
 const PLACEHOLDER_RE = /^\[\s*your[^\]]*\]$/i;
+
+// Default order. Override with GEMINI_MODELS / GROQ_MODELS (comma separated).
+// Model IDs change often: copy the exact IDs from Google AI Studio / Groq console.
+const DEFAULT_GEMINI_MODELS = [
+  'gemini-3.8-flash',
+  'gemini-3.6-flash',
+  'gemini-3.5-flash-lite',
+  'gemini-3.1-flash-lite',
+  'gemini-2.5-flash',
+  'gemini-2.5-flash-lite',
+  'gemini-2.5-pro'
+];
+const DEFAULT_GROQ_MODELS = ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant'];
+
+const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
+const GROQ_TIMEOUT_MS = 45000;
 
 /**
  * Creates an Error that already carries an HTTP status and is never re-mapped.
@@ -20,9 +41,39 @@ function httpError(message, status) {
   return err;
 }
 
-// Clean and validate model name
+// --- CONFIGURATION HELPERS ---
+function parseList(raw) {
+  return String(raw || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function hasGeminiKey() {
+  const key = process.env.GEMINI_API_KEY;
+  return Boolean(key && key.trim() !== '' && !key.startsWith('your_actual_'));
+}
+
+function hasGroqKey() {
+  return Boolean((process.env.GROQ_API_KEY || '').trim());
+}
+
+// GEMINI_MODELS replaces the default list. GEMINI_MODEL (single), if set, is tried first.
+function getGeminiModels() {
+  const configured = parseList(process.env.GEMINI_MODELS);
+  const base = configured.length ? configured : DEFAULT_GEMINI_MODELS;
+  const first = (process.env.GEMINI_MODEL || '').trim();
+  return Array.from(new Set(first ? [first, ...base] : base));
+}
+
+function getGroqModels() {
+  const configured = parseList(process.env.GROQ_MODELS);
+  return Array.from(new Set(configured.length ? configured : DEFAULT_GROQ_MODELS));
+}
+
+// Primary (first) model, shown by the health endpoint
 function getModelName() {
-  return process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+  return (process.env.GEMINI_MODEL || '').trim() || getGeminiModels()[0];
 }
 
 function getApiKey() {
@@ -31,6 +82,20 @@ function getApiKey() {
     throw httpError('GEMINI_API_KEY is not configured in the backend environment.', 500);
   }
   return key.trim();
+}
+
+/**
+ * Ordered list of { provider, model } to try for every request.
+ */
+function buildChain() {
+  const chain = [];
+  if (hasGeminiKey()) {
+    getGeminiModels().forEach((model) => chain.push({ provider: 'gemini', model }));
+  }
+  if (hasGroqKey()) {
+    getGroqModels().forEach((model) => chain.push({ provider: 'groq', model }));
+  }
+  return chain;
 }
 
 /**
@@ -164,11 +229,22 @@ function mapGeminiError(err, modelName, apiKey) {
 }
 
 /**
- * Single place that talks to Gemini. Returns the raw text of the response.
+ * Maps a Groq HTTP failure to a safe error with a proper status.
  */
-async function callModel(prompt, generationConfig = {}) {
+function mapGroqError(status, detail, apiKey, modelName) {
+  let msg = String(detail || '');
+  if (apiKey) msg = msg.split(apiKey).join('[REDACTED]');
+
+  if (status === 429) return httpError('Groq rate limit hit.', 429);
+  if (status === 401 || status === 403) return httpError('Invalid Groq API key. Check GROQ_API_KEY.', 403);
+  if (status === 404) return httpError(`The Groq model (${modelName}) was not found or is unavailable.`, 404);
+  if (status >= 500) return httpError('Groq is temporarily unavailable.', 503);
+  return httpError(`Groq API error (HTTP ${status})${msg ? `: ${msg}` : ''}`, 502);
+}
+
+// --- PROVIDER CALLS ---
+async function callGemini(modelName, prompt, generationConfig = {}) {
   const apiKey = getApiKey();
-  const modelName = getModelName();
 
   try {
     const genAI = new GoogleGenerativeAI(apiKey);
@@ -187,6 +263,135 @@ async function callModel(prompt, generationConfig = {}) {
   } catch (err) {
     throw mapGeminiError(err, modelName, apiKey);
   }
+}
+
+async function callGroq(modelName, prompt, generationConfig = {}) {
+  const apiKey = (process.env.GROQ_API_KEY || '').trim();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), GROQ_TIMEOUT_MS);
+
+  try {
+    // No response_format here: Groq's JSON mode only returns objects, but we
+    // ask for an array. parseModelJson() copes with plain JSON text.
+    const res = await fetch(GROQ_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        model: modelName,
+        messages: [
+          { role: 'system', content: SYSTEM_INSTRUCTION },
+          { role: 'user', content: prompt }
+        ],
+        temperature: typeof generationConfig.temperature === 'number' ? generationConfig.temperature : 0.2
+      }),
+      signal: controller.signal
+    });
+
+    if (!res.ok) {
+      let detail = '';
+      try {
+        const body = await res.json();
+        detail = body && body.error && body.error.message ? body.error.message : '';
+      } catch (_) {
+        detail = '';
+      }
+      throw mapGroqError(res.status, detail, apiKey, modelName);
+    }
+
+    const data = await res.json();
+    const text = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+    if (!text) throw httpError('Groq returned an empty response.', 502);
+    return text;
+  } catch (err) {
+    if (err && err.isAppError) throw err;
+    if (err && err.name === 'AbortError') throw httpError('Groq request timed out.', 503);
+    let msg = String((err && err.message) || 'network error');
+    if (apiKey) msg = msg.split(apiKey).join('[REDACTED]');
+    throw httpError(`Groq request failed: ${msg}`, 502);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// --- FALLBACK ENGINE ---
+// "provider:model" -> timestamp (ms) until which it is skipped
+const cooldowns = new Map();
+
+function cooldownMsFor(status) {
+  if (status === 404) return 6 * 60 * 60 * 1000; // model does not exist: skip for hours
+  if (status === 403) return 30 * 60 * 1000; // bad key / no access
+  if (status === 429) return 2 * 60 * 1000; // rate limit: probe again shortly
+  return 30 * 1000; // overloaded / temporary errors
+}
+
+function isCoolingDown(id) {
+  const until = cooldowns.get(id);
+  if (!until) return false;
+  if (Date.now() >= until) {
+    cooldowns.delete(id);
+    return false;
+  }
+  return true;
+}
+
+function resetCooldowns() {
+  cooldowns.clear();
+}
+
+/**
+ * Single place that talks to the AI providers. Returns the raw text of the response.
+ * Walks the chain (Gemini models, then Groq models) until one answers.
+ */
+async function callModel(prompt, generationConfig = {}) {
+  const chain = buildChain();
+  if (chain.length === 0) {
+    throw httpError('GEMINI_API_KEY is not configured in the backend environment.', 500);
+  }
+
+  let lastErr = null;
+  let sawRateLimit = false;
+
+  // Pass 0 respects the cooldowns. If EVERY model was cooling down (nothing could
+  // even be tried), pass 1 wraps around: it starts again from the first model
+  // (Gemini 3.8) and ignores the cooldowns, so a model whose limit has reset
+  // is picked up again immediately.
+  for (let pass = 0; pass < 2; pass++) {
+    const ignoreCooldown = pass === 1;
+    let attempted = 0;
+
+    for (const candidate of chain) {
+      const id = `${candidate.provider}:${candidate.model}`;
+      if (!ignoreCooldown && isCoolingDown(id)) continue;
+
+      attempted++;
+      try {
+        const text =
+          candidate.provider === 'groq'
+            ? await callGroq(candidate.model, prompt, generationConfig)
+            : await callGemini(candidate.model, prompt, generationConfig);
+        cooldowns.delete(id);
+        return text;
+      } catch (err) {
+        const status = err && Number.isInteger(err.status) ? err.status : 502;
+        if (status === 429) sawRateLimit = true;
+        lastErr = err;
+        cooldowns.set(id, Date.now() + cooldownMsFor(status));
+        console.warn(`[Fallback] ${id} failed (HTTP ${status}), trying the next model.`);
+      }
+    }
+
+    // Something was tried and failed: stop here (no second pass)
+    if (attempted > 0) break;
+  }
+
+  // Every model was rate limited or unavailable
+  if (sawRateLimit || !lastErr) {
+    throw httpError('All AI models are rate limited right now. Please try again in a few minutes.', 429);
+  }
+  throw lastErr;
 }
 
 function matchOption(value, options) {
@@ -281,6 +486,19 @@ function normalizeSuggestion(item, q) {
 }
 
 /**
+ * Some models wrap the array in an object, e.g. {"suggestions": [...]}.
+ * Returns the array inside, or the value unchanged.
+ */
+function unwrapArray(parsed) {
+  if (Array.isArray(parsed)) return parsed;
+  if (parsed && typeof parsed === 'object') {
+    const inner = Object.values(parsed).find(Array.isArray);
+    if (inner) return inner;
+  }
+  return parsed;
+}
+
+/**
  * Generates answer suggestions and explanations for an array of Google Forms questions
  * @param {Array} questions - Raw question objects (sanitized here)
  * @param {string} formTitle - Optional title/context of the form
@@ -325,7 +543,7 @@ Expected JSON Output Schema (one object per input question, same order):
 
   // Low temperature for high precision and factual adherence
   const rawText = await callModel(userPrompt, { temperature: 0.2, topP: 0.8 });
-  const parsed = parseModelJson(rawText);
+  const parsed = unwrapArray(parseModelJson(rawText));
 
   if (!Array.isArray(parsed)) {
     throw httpError('AI output format error: expected an array of question suggestions.', 502);
@@ -393,5 +611,8 @@ module.exports = {
   sanitizeQuestions,
   normalizeSuggestion,
   mapGeminiError,
-  parseModelJson
+  parseModelJson,
+  buildChain,
+  callModel,
+  resetCooldowns
 };
