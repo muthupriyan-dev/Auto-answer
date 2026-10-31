@@ -41,11 +41,21 @@ describe('Google Forms DOM Scanning, Safety & Approval Rules', () => {
     );
   });
 
-  test('Approval state map defaults to false (human verification mandatory)', () => {
-    // Verifies the code sets default approval to false
+  test('Approval is true only for the one-tap flow with a non-empty answer', () => {
     assert.ok(
-      contentJs.includes("state.approvedMap.set(s.questionId, false)"),
-      'Approval must default to false for each question'
+      contentJs.includes('const hasAnswer = !isEmptyAnswer(s.suggestedAnswer)'),
+      'Empty answers must never be approved'
+    );
+    assert.ok(
+      contentJs.includes('state.approvedMap.set(s.questionId, autoFill && hasAnswer)'),
+      'Manual suggestions (autoFill=false) must default to unapproved'
+    );
+  });
+
+  test('A regenerated answer requires re-approval', () => {
+    assert.ok(
+      contentJs.includes('state.approvedMap.set(qId, false)'),
+      'Regenerated suggestions must reset approval to false'
     );
   });
 
@@ -53,7 +63,7 @@ describe('Google Forms DOM Scanning, Safety & Approval Rules', () => {
     // Check that checkbox render uses checked conditional only if already approved
     assert.ok(
       contentJs.includes("${isApproved ? 'checked' : ''}"),
-      'Review checkboxes must be checked only if already approved by user'
+      'Review checkboxes must be checked only if already approved'
     );
   });
 
