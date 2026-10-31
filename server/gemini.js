@@ -29,7 +29,9 @@ const DEFAULT_GEMINI_MODELS = [
 const DEFAULT_GROQ_MODELS = ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant'];
 
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
-const GROQ_TIMEOUT_MS = 45000;
+const GROQ_TIMEOUT_MS = 25000;
+// A model that does not answer within this time is skipped (next model is tried)
+const MODEL_TIMEOUT_MS = Number(process.env.MODEL_TIMEOUT_MS) || 25000;
 
 /**
  * Creates an Error that already carries an HTTP status and is never re-mapped.
@@ -243,6 +245,14 @@ function mapGroqError(status, detail, apiKey, modelName) {
 }
 
 // --- PROVIDER CALLS ---
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(httpError(`${label} timed out after ${Math.round(ms / 1000)}s.`, 503)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 async function callGemini(modelName, prompt, generationConfig = {}) {
   const apiKey = getApiKey();
 
@@ -257,7 +267,7 @@ async function callGemini(modelName, prompt, generationConfig = {}) {
       }
     });
 
-    const result = await model.generateContent(prompt);
+    const result = await withTimeout(model.generateContent(prompt), MODEL_TIMEOUT_MS, `Gemini ${modelName}`);
     const response = await result.response;
     return response.text();
   } catch (err) {
@@ -367,19 +377,21 @@ async function callModel(prompt, generationConfig = {}) {
       if (!ignoreCooldown && isCoolingDown(id)) continue;
 
       attempted++;
+      const startedAt = Date.now();
       try {
         const text =
           candidate.provider === 'groq'
             ? await callGroq(candidate.model, prompt, generationConfig)
             : await callGemini(candidate.model, prompt, generationConfig);
         cooldowns.delete(id);
+        console.log(`[AI] ${id} answered in ${Date.now() - startedAt}ms`);
         return text;
       } catch (err) {
         const status = err && Number.isInteger(err.status) ? err.status : 502;
         if (status === 429) sawRateLimit = true;
         lastErr = err;
         cooldowns.set(id, Date.now() + cooldownMsFor(status));
-        console.warn(`[Fallback] ${id} failed (HTTP ${status}), trying the next model.`);
+        console.warn(`[Fallback] ${id} failed (HTTP ${status}) after ${Date.now() - startedAt}ms: ${err && err.message}`);
       }
     }
 
